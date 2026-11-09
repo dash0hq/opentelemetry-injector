@@ -32,6 +32,10 @@ inside the distribution.
 `register.js` must be **CommonJS**. An ESM entry point aborts the application on Node.js 18, and on *every* version if
 it uses top-level await (`ERR_REQUIRE_ASYNC_MODULE`).
 
+That is a constraint on *loading*, not on coverage: `module.register()` installs the ESM loader hook at runtime and can
+be called from a CommonJS file, so the distribution must instrument **CommonJS and ESM applications alike**. Upstream
+does not yet — an ESM app gets core-module spans only, which looks like working instrumentation.
+
 ## Neither side may break the app
 
 | | Allowed | Never |

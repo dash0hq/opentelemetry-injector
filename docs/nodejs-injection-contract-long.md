@@ -283,9 +283,21 @@ switched to `require.resolve` in
 reason.
 
 The entry point MUST be loadable by `node --require`: CommonJS, with a file extension Node.js resolves as CommonJS
-(`.js` under a distribution whose nearest `package.json` is not `"type": "module"`, or `.cjs`). A distribution that
-instruments ES module applications MUST do so from within that CommonJS entry point, by registering loader hooks via
-`module.register()`.
+(`.js` under a distribution whose nearest `package.json` is not `"type": "module"`, or `.cjs`).
+
+### Module format coverage
+
+The CommonJS requirement above constrains how the entry point is *loaded*. It says nothing about which applications the
+distribution can instrument, and the two must not be conflated: `module.register()` installs an ES module loader hook at
+runtime and can be called from a CommonJS file loaded with `--require`, so a CommonJS entry point is fully capable of
+instrumenting ES module applications.
+
+A distribution MUST therefore instrument applications of both module formats, and MUST state in its documented
+prerequisites which formats it covers where that coverage is partial. The reason is the injector's blast radius: it
+activates on every Node.js process on a host, and the operator does not choose, per application, whether the one being
+instrumented is CommonJS or ESM. A distribution that silently covers only one format produces, for the applications it
+misses, exactly the signature this contract exists to eliminate — telemetry that looks present because core-module spans
+still arrive, with the application's own libraries missing and nothing indicating why.
 
 ### Self-containment
 
@@ -360,14 +372,30 @@ that hook:
   for as long as the exporter keeps retrying — measured at 5 seconds in
   [#3349](https://github.com/open-telemetry/opentelemetry-js-contrib/issues/3349). This is independent of the `SIGTERM`
   gap above: fixing the signal handling makes the process exit, but it still exits late.
+- **Does not instrument ES module applications.** Nothing in the hook registers an ES module loader: the `Hook` from
+  `import-in-the-middle` is constructed per instrumentation, but the loader it needs —
+  `@opentelemetry/instrumentation/hook.mjs`, which upstream exports and uses in its own tests via
+  `--experimental-loader` — is never registered, by `module.register()` or otherwise. Measured on 0.83.0, Node 26.4.0,
+  with one identical application written twice:
+
+  | activation | app | `express` patched | modules patched |
+  | --- | --- | --- | --- |
+  | `--require dist/register.cjs` | `app.cjs` | yes | `express`, `http`, `net`, `router` |
+  | `--require dist/register.cjs` | `app.mjs` | **no** | `http`, `net`, `router` |
+  | `--import dist/register.mjs` | `app.mjs` | **no** | `http`, `net`, `router` |
+
+  The ESM application still produces spans, because core modules are reached through the CommonJS binding and
+  `require-in-the-middle` — `router` is patched only because `express` itself requires it internally — so the
+  application appears instrumented while every userland library it imports is missing. The third row matters for scope:
+  this is not a limitation of `--require`, and an injector cannot work around it by activating differently.
 
 A distribution wrapping it MUST therefore compensate in its own `register.js` — guarding the require, managing signal
-handlers itself, bounding the shutdown, and keeping upstream's output off stdout — until these are fixed upstream. The
-packaged distribution's entry point already guards the require and manages signal handlers for its
-declarative-configuration path.
+handlers itself, bounding the shutdown, registering the ES module loader, and keeping upstream's output off stdout —
+until these are fixed upstream. The packaged distribution's entry point already guards the require and manages signal
+handlers for its declarative-configuration path.
 
 [opentelemetry-js-contrib#3888](https://github.com/open-telemetry/opentelemetry-js-contrib/pull/3888) is open with
-fixes for the first three. It does not address the fourth, and the `SIGTERM` fix it proposes awaits the SDK shutdown
+fixes for the first three. It does not address the last two, and the `SIGTERM` fix it proposes awaits the SDK shutdown
 before re-raising the signal, so on an unreachable collector it converts a process that never stops into one that stops
 late — the gap moves rather than closing.
 
@@ -561,7 +589,10 @@ An injectable distribution conforms if, on a runtime satisfying its documented p
    uninstrumented run.
 9. `register.js` is CommonJS: it loads on the distribution's minimum supported Node.js version and on every later one,
    including versions without `require(esm)`.
-10. The instrumented application's stdout is byte-identical to the uninstrumented run's, at every `OTEL_LOG_LEVEL`.
+10. The same application, written once as CommonJS and once as ES modules, is instrumented identically — asserted on a
+    *userland* library the application imports, not on a core module, since core modules are patched through the
+    CommonJS binding regardless of the application's own format and will mask the difference.
+11. The instrumented application's stdout is byte-identical to the uninstrumented run's, at every `OTEL_LOG_LEVEL`.
 
 The injector conforms if, for every supported configuration form:
 
