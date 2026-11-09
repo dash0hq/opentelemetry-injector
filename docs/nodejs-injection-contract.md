@@ -40,9 +40,13 @@ it uses top-level await (`ERR_REQUIRE_ASYNC_MODULE`).
 | Unsupported Node.js version | Run uninstrumented | Throw |
 | Missing or invalid SDK config | Run uninstrumented | Throw |
 | Broken dependency in the distribution | Run uninstrumented | Throw |
-| Shutdown flush fails | Exit normally | Change exit code, hold `SIGTERM` |
+| Shutdown flush fails | Exit normally | Change exit code |
+| Collector unreachable at shutdown | Give up on a deadline, exit³ | Block termination indefinitely |
 
 **Everything that fails during `--require` kills the application before its first line.** Degrade, never fail.
+
+³ A few hundred milliseconds is fine, seconds are not: the wait is paid on every rolling update and every scale-down.
+Losing the last batch of spans is better than a process that will not stop.
 
 ## Changing the contract
 

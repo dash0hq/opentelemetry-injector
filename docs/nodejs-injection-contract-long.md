@@ -328,10 +328,20 @@ not constitute application failure". For Node.js, meeting that bar means the ent
 
 - MUST NOT alter the host's exit code, including on flush failure.
 - MUST NOT leave a persistent `SIGTERM` (or other termination signal) listener installed in a way that suppresses
-  Node.js's default terminate behavior. An application that stops responding to `docker stop` or `systemctl stop`
-  because it was instrumented has failed at runtime, from the operator's point of view.
+  Node.js's default terminate behavior. Registering a listener replaces that default, so a distribution that registers
+  one and neither exits nor re-raises the signal holds the process *indefinitely*: it stops responding to `docker stop`
+  or `systemctl stop` altogether, and dies only when its orchestrator's grace period expires and it is `SIGKILL`ed. From
+  the operator's point of view that is an application that failed at runtime.
 - MUST NOT write to stdout, at any log level. Diagnostics go to stderr.
-- SHOULD bound any shutdown flush it performs, so that an unreachable collector cannot delay or prevent process exit.
+- MUST bound any shutdown flush it performs. Termination MUST NOT wait on network I/O without a deadline: when the
+  deadline expires the entry point proceeds with termination and abandons the unflushed telemetry, because losing the
+  last batch of spans is a smaller failure than a process that will not stop.
+
+The deadline is a trade of telemetry completeness against termination latency, and this contract deliberately does not
+fix a number. The guidance is that a few hundred milliseconds is unobjectionable and that seconds are not: a delay on
+every shutdown is paid on every rolling update and every scale-down, where it slows pod restarts for an entire fleet.
+[opentelemetry-js-contrib#3349](https://github.com/open-telemetry/opentelemetry-js-contrib/issues/3349) is the concrete
+case — a 5-second block on an unavailable collector — and sits at the wrong end of that range.
 
 #### Known gaps in upstream `@opentelemetry/auto-instrumentations-node/register`
 
@@ -346,10 +356,20 @@ that hook:
   there. Measured on 0.82.0: 3 stdout lines at info, 222 at debug, 1 on stderr.
 - **Can throw during `--require`.** Its own imports are not wrapped, so a resolution or initialization failure
   propagates out of the `--require` phase and aborts the host application.
+- **Does not bound its shutdown flush.** With an unreachable collector, the shutdown it performs on termination blocks
+  for as long as the exporter keeps retrying — measured at 5 seconds in
+  [#3349](https://github.com/open-telemetry/opentelemetry-js-contrib/issues/3349). This is independent of the `SIGTERM`
+  gap above: fixing the signal handling makes the process exit, but it still exits late.
 
 A distribution wrapping it MUST therefore compensate in its own `register.js` — guarding the require, managing signal
-handlers itself, and keeping upstream's output off stdout — until these are fixed upstream. The packaged
-distribution's entry point already does the first two for its declarative-configuration path.
+handlers itself, bounding the shutdown, and keeping upstream's output off stdout — until these are fixed upstream. The
+packaged distribution's entry point already guards the require and manages signal handlers for its
+declarative-configuration path.
+
+[opentelemetry-js-contrib#3888](https://github.com/open-telemetry/opentelemetry-js-contrib/pull/3888) is open with
+fixes for the first three. It does not address the fourth, and the `SIGTERM` fix it proposes awaits the SDK shutdown
+before re-raising the signal, so on an unreachable collector it converts a process that never stops into one that stops
+late — the gap moves rather than closing.
 
 ### Idempotent loading
 
@@ -530,8 +550,9 @@ An injectable distribution conforms if, on a runtime satisfying its documented p
 3. `node --require <entry point> --require <entry point> app.js` behaves identically to a single `--require`.
 4. The entry point loads with the distribution root read-only, from an arbitrary working directory, with `NODE_PATH`
    unset, and with a host `node_modules` containing conflicting OpenTelemetry package versions.
-5. A `SIGTERM` sent to the instrumented process terminates it, in the same manner and within the same time as the
-   uninstrumented process.
+5. A `SIGTERM` sent to the instrumented process terminates it in the same manner as the uninstrumented process, and
+   within a bounded delay of it. The delay is bounded with the collector *unreachable*, not merely absent: a test that
+   exports nowhere never exercises the flush path that produces the delay.
 6. Deleting or corrupting a dependency inside the distribution root causes the application to start uninstrumented, not
    to fail.
 7. The application starts and is instrumented with no `OTEL_CONFIG_FILE` set, and starts uninstrumented — with the same
